@@ -1,0 +1,24 @@
+version: '3.8'
+
+services:
+  backend:
+    build: ./backend
+    container_name: fusion_rag_backend
+    ports:
+      - "8000:8000"
+    environment:
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - NEO4J_URI=${NEO4J_URI}
+      - NEO4J_USERNAME=${NEO4J_USERNAME}
+      - NEO4J_PASSWORD=${NEO4J_PASSWORD}
+    volumes:
+      - ./faiss_index:/app/faiss_index
+      - ./temp_docs:/app/temp_docs
+
+  frontend:
+    build: ./frontend
+    container_name: fusion_rag_frontend
+    ports:
+      - "8501:8501"
+    depends_on:
+      - backend
