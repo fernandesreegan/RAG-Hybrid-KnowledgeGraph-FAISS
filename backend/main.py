@@ -152,13 +152,8 @@ async def ingest_document(file: UploadFile = File(...)):
         if os.path.exists(file_path):
             os.remove(file_path)
 
-
 @app.post("/retrieve")
 def retrieve(query: str = Query(..., description="User search prompt")) -> Dict[str, Any]:
-    """
-    Perform hybrid retrieval across both FAISS (vector similarity)
-    and Neo4j (dynamic keyword matching against extracted entity relationships).
-    """
     # 1. FAISS Vector Search
     vector_store = get_faiss_vector_store()
     vector_results = []
@@ -175,7 +170,7 @@ def retrieve(query: str = Query(..., description="User search prompt")) -> Dict[
         except Exception as e:
             print(f"FAISS retrieval error: {e}")
 
-    # 2. Dynamic Neo4j Graph Retrieval using user query keywords
+    # 2. Dynamic Neo4j Graph Retrieval (Strict keyword match only)
     search_terms = [term.strip().lower() for term in query.split() if len(term.strip()) > 2]
     
     cypher_query = """
@@ -197,22 +192,6 @@ def retrieve(query: str = Query(..., description="User search prompt")) -> Dict[
                     "Relation": record["Relation"],
                     "Target": record["Target"]
                 })
-
-        # Fallback to general paths if specific keywords don't match
-        if not graph_results:
-            fallback_cypher = """
-            MATCH (n)-[r]->(m)
-            RETURN coalesce(n.id, n.name) AS Source, type(r) AS Relation, coalesce(m.id, m.name) AS Target
-            LIMIT 6
-            """
-            with neo4j_driver.session(database=NEO4J_DATABASE) as session:
-                fallback_res = session.run(fallback_cypher)
-                for record in fallback_res:
-                    graph_results.append({
-                        "Source": record["Source"],
-                        "Relation": record["Relation"],
-                        "Target": record["Target"]
-                    })
     except Exception as e:
         print(f"Neo4j dynamic retrieval error: {e}")
 
@@ -220,7 +199,6 @@ def retrieve(query: str = Query(..., description="User search prompt")) -> Dict[
         "vector_results": vector_results,
         "graph_results": graph_results
     }
-
 
 @app.post("/generate-answer")
 def generate_answer(query: str = Query(..., description="User question")):
