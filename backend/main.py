@@ -12,6 +12,8 @@ from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 from langchain_community.vectorstores import FAISS
 from langchain_experimental.graph_transformers import LLMGraphTransformer
 from langchain_community.graphs import Neo4jGraph
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.output_parsers import StrOutputParser
 from neo4j import GraphDatabase
 
 app = FastAPI(
@@ -132,7 +134,6 @@ async def ingest_document(file: UploadFile = File(...)):
         )
         graph_db.add_graph_documents(graph_documents)
 
-        # Count total nodes and relationships created
         nodes_count = sum(len(gd.nodes) for gd in graph_documents)
         relationships_count = sum(len(gd.relationships) for gd in graph_documents)
 
@@ -153,7 +154,7 @@ async def ingest_document(file: UploadFile = File(...)):
 
 
 @app.post("/retrieve")
-def retrieve(query: str = Query(..., description="User search prompt")):
+def retrieve(query: str = Query(..., description="User search prompt")) -> Dict[str, Any]:
     """
     Perform hybrid retrieval across both FAISS (vector similarity)
     and Neo4j (dynamic keyword matching against extracted entity relationships).
@@ -164,7 +165,6 @@ def retrieve(query: str = Query(..., description="User search prompt")):
     
     if vector_store:
         try:
-            # Perform similarity search with distance score
             results = vector_store.similarity_search_with_score(query, k=3)
             for doc, score in results:
                 vector_results.append({
@@ -175,8 +175,7 @@ def retrieve(query: str = Query(..., description="User search prompt")):
         except Exception as e:
             print(f"FAISS retrieval error: {e}")
 
-    # 2. Dynamic Neo4j Graph Retrieval
-    # Extract terms from user prompt to run targeted Cypher search
+    # 2. Dynamic Neo4j Graph Retrieval using user query keywords
     search_terms = [term.strip().lower() for term in query.split() if len(term.strip()) > 2]
     
     cypher_query = """
@@ -199,8 +198,8 @@ def retrieve(query: str = Query(..., description="User search prompt")):
                     "Target": record["Target"]
                 })
 
-        # Fallback to broader entity match if exact word filter yields 0 matches
-        if not graph_results and search_terms:
+        # Fallback to general paths if specific keywords don't match
+        if not graph_results:
             fallback_cypher = """
             MATCH (n)-[r]->(m)
             RETURN coalesce(n.id, n.name) AS Source, type(r) AS Relation, coalesce(m.id, m.name) AS Target
@@ -220,4 +219,32 @@ def retrieve(query: str = Query(..., description="User search prompt")):
     return {
         "vector_results": vector_results,
         "graph_results": graph_results
+    }
+
+
+@app.post("/generate-answer")
+def generate_answer(query: str = Query(..., description="User question")):
+    """
+    Combines hybrid retrieval results (FAISS chunks + Neo4j graph paths)
+    and uses OpenAI to synthesize a precise natural language response.
+    """
+    retrieval_data = retrieve(query)
+    
+    context_texts = [item["page_content"] for item in retrieval_data["vector_results"]]
+    graph_texts = [f"{p['Source']} - [{p['Relation']}] -> {p['Target']}" for p in retrieval_data["graph_results"]]
+    
+    combined_context = "\n---\n".join(context_texts + graph_texts)
+    
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", "You are an expert technical assistant. Answer the user's question accurately using ONLY the provided context from vector chunks and knowledge graph paths."),
+        ("user", "Context:\n{context}\n\nQuestion: {question}")
+    ])
+    
+    chain = prompt | llm | StrOutputParser()
+    answer = chain.invoke({"context": combined_context, "question": query})
+    
+    return {
+        "answer": answer,
+        "vector_results": retrieval_data["vector_results"],
+        "graph_results": retrieval_data["graph_results"]
     }
