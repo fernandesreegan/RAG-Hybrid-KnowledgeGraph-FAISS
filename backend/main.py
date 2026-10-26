@@ -1,123 +1,223 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException
-from pydantic import BaseModel
 import os
 import shutil
-from dotenv import load_dotenv
+from typing import List, Dict, Any
+from fastapi import FastAPI, UploadFile, File, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 
+# LangChain and Vector/Graph Libraries
 from langchain_community.document_loaders import PyPDFLoader, TextLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 from langchain_community.vectorstores import FAISS
 from langchain_experimental.graph_transformers import LLMGraphTransformer
 from langchain_community.graphs import Neo4jGraph
-import networkx as nx
+from neo4j import GraphDatabase
 
-load_dotenv()
+app = FastAPI(
+    title="Hybrid Fusion RAG Backend",
+    description="Decoupled FastAPI backend handling FAISS vector storage and Neo4j Knowledge Graph extraction.",
+    version="1.0.0"
+)
 
-app = FastAPI(title="Fusion RAG Backend", version="1.0")
+# Enable CORS for frontend interaction
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-FAISS_INDEX_PATH = "/app/faiss_index"
-TEMP_DIR = "/app/temp_docs"
-os.makedirs(TEMP_DIR, exist_ok=True)
+# Configuration from environment variables
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+NEO4J_URI = os.getenv("NEO4J_URI")
+NEO4J_USERNAME = os.getenv("NEO4J_USERNAME")
+NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD")
+NEO4J_DATABASE = os.getenv("NEO4J_DATABASE", "c06e9654")
 
-class QueryRequest(BaseModel):
-    query: str
+FAISS_INDEX_DIR = "/app/faiss_index"
+TEMP_DOCS_DIR = "/app/temp_docs"
 
-@app.post("/process")
-async def process_document(file: UploadFile = File(...)):
-    file_path = os.path.join(TEMP_DIR, file.filename)
-    with open(file_path, "wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
-        
-    try:
-        # 1. FAISS Pipeline
-        if file.filename.endswith(".pdf"):
-            loader = PyPDFLoader(file_path)
-        elif file.filename.endswith(".txt"):
-            loader = TextLoader(file_path, encoding="utf-8")
-        else:
-            raise HTTPException(status_code=400, detail="Unsupported file format.")
-            
-        documents = loader.load()
-        text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
-        docs = text_splitter.split_documents(documents)
-        
-        embeddings = OpenAIEmbeddings()
-        faiss_db = FAISS.from_documents(docs, embeddings)
-        faiss_db.save_local(FAISS_INDEX_PATH)
-        
-        # 2. Knowledge Graph Pipeline
-        llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
-        graph_transformer = LLMGraphTransformer(llm=llm)
-        graph_documents = graph_transformer.convert_to_graph_documents(docs[:15])
-        
-        neo4j_graph = Neo4jGraph(
-            url=os.getenv("NEO4J_URI"),
-            username=os.getenv("NEO4J_USERNAME"),
-            password=os.getenv("NEO4J_PASSWORD")
+os.makedirs(FAISS_INDEX_DIR, exist_ok=True)
+os.makedirs(TEMP_DOCS_DIR, exist_ok=True)
+
+# Initialize OpenAI Models
+embeddings = OpenAIEmbeddings(openai_api_key=OPENAI_API_KEY)
+llm = ChatOpenAI(model_name="gpt-4o-mini", temperature=0, openai_api_key=OPENAI_API_KEY)
+
+# Initialize Direct Neo4j Driver
+neo4j_driver = GraphDatabase.driver(
+    NEO4J_URI,
+    auth=(NEO4J_USERNAME, NEO4J_PASSWORD)
+)
+
+
+def get_faiss_vector_store():
+    """Load existing FAISS index or return None if not initialized."""
+    index_file = os.path.join(FAISS_INDEX_DIR, "index.faiss")
+    if os.path.exists(index_file):
+        return FAISS.load_local(
+            FAISS_INDEX_DIR, 
+            embeddings, 
+            allow_dangerous_deserialization=True
         )
-        neo4j_graph.add_graph_documents(graph_documents, include_source=True)
-        
-        nx_graph = nx.DiGraph()
-        total_nodes = 0
-        total_rels = 0
-        for gdoc in graph_documents:
-            for node in gdoc.nodes:
-                nx_graph.add_node(node.id, type=node.type)
-                total_nodes += 1
-            for rel in gdoc.relationships:
-                nx_graph.add_edge(rel.source.id, rel.target.id, type=rel.type)
-                total_rels += 1
+    return None
+
+
+@app.get("/health")
+def health_check():
+    """Verify backend and Neo4j connection status."""
+    try:
+        with neo4j_driver.session(database=NEO4J_DATABASE) as session:
+            result = session.run("RETURN 1 AS status")
+            status = result.single()["status"]
+            neo4j_ok = (status == 1)
+    except Exception as e:
+        neo4j_ok = False
+        print(f"Healthcheck Neo4j Error: {e}")
+
+    return {
+        "status": "online",
+        "neo4j_connected": neo4j_ok,
+        "faiss_index_exists": os.path.exists(os.path.join(FAISS_INDEX_DIR, "index.faiss"))
+    }
+
+
+@app.post("/ingest")
+async def ingest_document(file: UploadFile = File(...)):
+    """
+    Ingest a document (PDF or TXT):
+    1. Chunk text and add to local FAISS index.
+    2. Extract entities/relationships via LLM and write to Neo4j.
+    """
+    file_path = os.path.join(TEMP_DOCS_DIR, file.filename)
+    try:
+        with open(file_path, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+
+        # 1. Load Document
+        if file.filename.lower().endswith(".pdf"):
+            loader = PyPDFLoader(file_path)
+        elif file.filename.lower().endswith(".txt"):
+            loader = TextLoader(file_path)
+        else:
+            raise HTTPException(status_code=400, detail="Unsupported file format. Please upload PDF or TXT.")
+
+        docs = loader.load()
+
+        # 2. Split Document into Chunks
+        text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=150)
+        chunks = text_splitter.split_documents(docs)
+
+        # 3. Save / Update FAISS Index
+        vector_store = get_faiss_vector_store()
+        if vector_store is None:
+            vector_store = FAISS.from_documents(chunks, embeddings)
+        else:
+            vector_store.add_documents(chunks)
+
+        vector_store.save_local(FAISS_INDEX_DIR)
+
+        # 4. LLM Graph Extraction for Knowledge Graph
+        llm_transformer = LLMGraphTransformer(llm=llm)
+        graph_documents = llm_transformer.convert_to_graph_documents(chunks)
+
+        # Save to Neo4j via LangChain Neo4jGraph wrapper
+        graph_db = Neo4jGraph(
+            url=NEO4J_URI,
+            username=NEO4J_USERNAME,
+            password=NEO4J_PASSWORD,
+            database=NEO4J_DATABASE
+        )
+        graph_db.add_graph_documents(graph_documents)
+
+        # Count total nodes and relationships created
+        nodes_count = sum(len(gd.nodes) for gd in graph_documents)
+        relationships_count = sum(len(gd.relationships) for gd in graph_documents)
 
         return {
-            "status": "success",
-            "total_chunks": len(docs),
-            "total_nodes": total_nodes,
-            "total_rels": total_rels
+            "filename": file.filename,
+            "chunks": len(chunks),
+            "nodes": nodes_count,
+            "relationships": relationships_count,
+            "message": "Knowledge Base updated successfully!"
         }
+
     except Exception as e:
+        print(f"Ingestion error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        if os.path.exists(file_path):
+            os.remove(file_path)
+
 
 @app.post("/retrieve")
-async def retrieve_data(payload: QueryRequest):
-    query = payload.query
-    results = {"faiss": [], "neo4j": []}
+def retrieve(query: str = Query(..., description="User search prompt")):
+    """
+    Perform hybrid retrieval across both FAISS (vector similarity)
+    and Neo4j (dynamic keyword matching against extracted entity relationships).
+    """
+    # 1. FAISS Vector Search
+    vector_store = get_faiss_vector_store()
+    vector_results = []
     
-    # 1. Query FAISS
-    try:
-        if os.path.exists(FAISS_INDEX_PATH):
-            embeddings = OpenAIEmbeddings()
-            loaded_faiss = FAISS.load_local(FAISS_INDEX_PATH, embeddings, allow_dangerous_deserialization=True)
-            docs_and_scores = loaded_faiss.similarity_search_with_score(query, k=3)
-            for doc, score in docs_and_scores:
-                results["faiss"].append({
-                    "content": doc.page_content,
+    if vector_store:
+        try:
+            # Perform similarity search with distance score
+            results = vector_store.similarity_search_with_score(query, k=3)
+            for doc, score in results:
+                vector_results.append({
+                    "page_content": doc.page_content,
                     "metadata": doc.metadata,
-                    "score": float(score)
+                    "score": round(float(score), 4)
                 })
-    except Exception as e:
-        results["faiss_error"] = str(e)
-        
-    # 2. Query Neo4j
+        except Exception as e:
+            print(f"FAISS retrieval error: {e}")
+
+    # 2. Dynamic Neo4j Graph Retrieval
+    # Extract terms from user prompt to run targeted Cypher search
+    search_terms = [term.strip().lower() for term in query.split() if len(term.strip()) > 2]
+    
+    cypher_query = """
+    MATCH (n)-[r]->(m)
+    WHERE any(term IN $search_terms WHERE toLower(coalesce(n.id, n.name, '')) CONTAINS term
+       OR toLower(coalesce(m.id, m.name, '')) CONTAINS term
+       OR toLower(type(r)) CONTAINS term)
+    RETURN coalesce(n.id, n.name) AS Source, type(r) AS Relation, coalesce(m.id, m.name) AS Target
+    LIMIT 12
+    """
+
+    graph_results = []
     try:
-        neo4j_graph = Neo4jGraph(
-            url=os.getenv("NEO4J_URI"),
-            username=os.getenv("NEO4J_USERNAME"),
-            password=os.getenv("NEO4J_PASSWORD")
-        )
-        cypher_query = """
-        MATCH (s)-[r]->(t)
-        RETURN s.id AS source, type(r) AS relationship, t.id AS target
-        LIMIT 10
-        """
-        graph_results = neo4j_graph.query(cypher_query)
-        for record in graph_results:
-            results["neo4j"].append({
-                "source": record["source"],
-                "relationship": record["relationship"],
-                "target": record["target"]
-            })
+        with neo4j_driver.session(database=NEO4J_DATABASE) as session:
+            db_res = session.run(cypher_query, search_terms=search_terms)
+            for record in db_res:
+                graph_results.append({
+                    "Source": record["Source"],
+                    "Relation": record["Relation"],
+                    "Target": record["Target"]
+                })
+
+        # Fallback to broader entity match if exact word filter yields 0 matches
+        if not graph_results and search_terms:
+            fallback_cypher = """
+            MATCH (n)-[r]->(m)
+            RETURN coalesce(n.id, n.name) AS Source, type(r) AS Relation, coalesce(m.id, m.name) AS Target
+            LIMIT 6
+            """
+            with neo4j_driver.session(database=NEO4J_DATABASE) as session:
+                fallback_res = session.run(fallback_cypher)
+                for record in fallback_res:
+                    graph_results.append({
+                        "Source": record["Source"],
+                        "Relation": record["Relation"],
+                        "Target": record["Target"]
+                    })
     except Exception as e:
-        results["neo4j_error"] = str(e)
-        
-    return results
+        print(f"Neo4j dynamic retrieval error: {e}")
+
+    return {
+        "vector_results": vector_results,
+        "graph_results": graph_results
+    }
